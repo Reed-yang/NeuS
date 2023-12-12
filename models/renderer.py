@@ -206,44 +206,59 @@ class NeuSRenderer:
         batch_size, n_samples = z_vals.shape
 
         # Section length
+        # 求 z_vals 中点
         dists = z_vals[..., 1:] - z_vals[..., :-1]
+        # dists 即 采样点间隔距离，最后一段用固定 sample_dist 补充，使每个采样点都有对应的区间长度
         dists = torch.cat([dists, torch.Tensor([sample_dist]).expand(dists[..., :1].shape)], -1)
+        # 求 z_vals 中点
         mid_z_vals = z_vals + dists * 0.5
 
         # Section midpoints
+        # pts 为每个采样点的坐标，通过rays_o + rays_d * z_vals得到
         pts = rays_o[:, None, :] + rays_d[:, None, :] * mid_z_vals[..., :, None]  # n_rays, n_samples, 3
+        # dirs 即光线方向，等价于 rays_d
         dirs = rays_d[:, None, :].expand(pts.shape)
 
         pts = pts.reshape(-1, 3)
         dirs = dirs.reshape(-1, 3)
 
+        # sdf_network 输入 采样点坐标 得到 sdf(第一个元素) 和 feature_vector(其余的元素)
         sdf_nn_output = sdf_network(pts)
         sdf = sdf_nn_output[:, :1]
         feature_vector = sdf_nn_output[:, 1:]
 
+        # 梯度作为Normal输入 color_network
         gradients = sdf_network.gradient(pts).squeeze()
+        # 通过查询 color_network 得到 sampled_color 即 c_i
         sampled_color = color_network(pts, gradients, dirs, feature_vector).reshape(batch_size, n_samples, 3)
 
         inv_s = deviation_network(torch.zeros([1, 3]))[:, :1].clip(1e-6, 1e6)           # Single parameter
         inv_s = inv_s.expand(batch_size * n_samples, 1)
 
+        # 通过光线方向 和 法线 计算 余弦 TODO: 作用是?
+        # 此处 cos 为 光线方向 与 法线方向 夹角 的余弦值
         true_cos = (dirs * gradients).sum(-1, keepdim=True)
 
+        # cos 训练的 退火策略
         # "cos_anneal_ratio" grows from 0 to 1 in the beginning training iterations. The anneal strategy below makes
         # the cos value "not dead" at the beginning training iterations, for better convergence.
         iter_cos = -(F.relu(-true_cos * 0.5 + 0.5) * (1.0 - cos_anneal_ratio) +
                      F.relu(-true_cos) * cos_anneal_ratio)  # always non-positive
 
+        # 通过考虑光线方向与表面法线之间的关系来调整SDF的估计值
         # Estimate signed distances at section points
+        # TODO: 此处为 sdf +- 采样点间隔 * cos(光线与法线夹角) -> sdf +- 光线上采样点间隔在法线上的投影
         estimated_next_sdf = sdf + iter_cos * dists.reshape(-1, 1) * 0.5
         estimated_prev_sdf = sdf - iter_cos * dists.reshape(-1, 1) * 0.5
 
+        # estimated_prev_sdf * inv_s -> f(p(t_i)) TODO: why?
         prev_cdf = torch.sigmoid(estimated_prev_sdf * inv_s)
         next_cdf = torch.sigmoid(estimated_next_sdf * inv_s)
 
         p = prev_cdf - next_cdf
         c = prev_cdf
 
+        # \alpha_i = \max\left(\frac{\Phi_s(f(p(t_i))) - \Phi_s(f(p(t_{i+1})))}{\Phi_s(f(p(t_i)))}, 0\right)
         alpha = ((p + 1e-5) / (c + 1e-5)).reshape(batch_size, n_samples).clip(0.0, 1.0)
 
         pts_norm = torch.linalg.norm(pts, ord=2, dim=-1, keepdim=True).reshape(batch_size, n_samples)
@@ -258,10 +273,13 @@ class NeuSRenderer:
                             background_sampled_color[:, :n_samples] * (1.0 - inside_sphere)[:, :, None]
             sampled_color = torch.cat([sampled_color, background_sampled_color[:, n_samples:]], dim=1)
 
+        # weights 即连续形式下的w(t), 也即离散形式下的累计透射率 T_i
         weights = alpha * torch.cumprod(torch.cat([torch.ones([batch_size, 1]), 1. - alpha + 1e-7], -1), -1)[:, :-1]
         weights_sum = weights.sum(dim=-1, keepdim=True)
 
+        # accumulate the colors along the ray -> C(o,v) = \int_0^{+\infty} w(t)c(p(t),v)dt
         color = (sampled_color * weights[:, :, None]).sum(dim=1)
+        # TODO: weights_sum 作用?
         if background_rgb is not None:    # Fixed background, usually black
             color = color + background_rgb * (1.0 - weights_sum)
 
@@ -285,8 +303,11 @@ class NeuSRenderer:
 
     def render(self, rays_o, rays_d, near, far, perturb_overwrite=-1, background_rgb=None, cos_anneal_ratio=0.0):
         batch_size = len(rays_o)
+        # sample_dist = 单位球直径 / 采样点数，即每个采样点的间隔
         sample_dist = 2.0 / self.n_samples   # Assuming the region of interest is a unit sphere
+        # 通过插值生成 z_vals 
         z_vals = torch.linspace(0.0, 1.0, self.n_samples)
+        # 将 z_vals 从单位区间 [0, 1] 转换到实际的渲染区间 [near, far]
         z_vals = near + (far - near) * z_vals[None, :]
 
         z_vals_outside = None

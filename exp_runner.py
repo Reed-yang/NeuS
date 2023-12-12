@@ -303,10 +303,12 @@ class Runner:
         """
         rays_o, rays_d = self.dataset.gen_rays_between(idx_0, idx_1, ratio, resolution_level=resolution_level)
         H, W, _ = rays_o.shape
+        # 将 ray 从 [H, W, 3] 变成 [H * W, 3] 再 split，最后即 [batch_size, 3] 组成的tuple
         rays_o = rays_o.reshape(-1, 3).split(self.batch_size)
         rays_d = rays_d.reshape(-1, 3).split(self.batch_size)
 
         out_rgb_fine = []
+        # rays_o 和 rays_d 是一个tuple，每个元素是一个tensor，shape为[batch_size, 3]，即每个元素有batch_size个ray
         for rays_o_batch, rays_d_batch in zip(rays_o, rays_d):
             near, far = self.dataset.near_far_from_sphere(rays_o_batch, rays_d_batch)
             background_rgb = torch.ones([1, 3]) if self.use_white_bkgd else None
@@ -348,6 +350,7 @@ class Runner:
             print(i)
             images.append(self.render_novel_image(img_idx_0,
                                                   img_idx_1,
+                                                  # ratio 值在 i 从 0 到 n_frames 变化时，会先从 0 增加到 1，然后再减少到 0
                                                   np.sin(((i / n_frames) - 0.5) * np.pi) * 0.5 + 0.5,
                           resolution_level=4))
         for i in range(n_frames):
